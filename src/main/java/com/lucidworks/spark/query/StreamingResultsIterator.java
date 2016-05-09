@@ -1,5 +1,6 @@
 package com.lucidworks.spark.query;
 
+import com.lucidworks.spark.SolrReplica;
 import com.lucidworks.spark.util.SolrQuerySupport;
 import org.apache.log4j.Logger;
 import org.apache.solr.client.solrj.SolrClient;
@@ -12,14 +13,16 @@ import org.apache.solr.client.solrj.response.QueryResponse;
 import org.apache.solr.common.SolrDocument;
 import scala.Option;
 
+import java.util.Collections;
 import java.util.Iterator;
+import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.TimeUnit;
 
 /**
- * An iterator over a stream of query results from Solr.
+ * An iterator over a stream of query results from Solr using cursor marks.
  */
 public class StreamingResultsIterator extends ResultsIterator {
 
@@ -39,17 +42,30 @@ public class StreamingResultsIterator extends ResultsIterator {
   protected Integer maxSampleDocs = null;
   protected String solrId = null;
 
+  private List<SolrReplica> replicas;
   private ResponseCallback responseCallback = new ResponseCallback();
   private CountDownLatch docListInfoLatch = new CountDownLatch(1);
 
   public StreamingResultsIterator(SolrClient solrServer, SolrQuery solrQuery) {
-    this(solrServer, solrQuery, null);
+    this(solrServer, solrQuery, null, Collections.<SolrReplica>emptyList());
   }
 
-  public StreamingResultsIterator(SolrClient solrServer, SolrQuery solrQuery, String cursorMark) {
+  public StreamingResultsIterator(
+      SolrClient solrServer,
+      SolrQuery solrQuery,
+      List<SolrReplica> replicas) {
+    this(solrServer, solrQuery, null, replicas);
+  }
+
+  public StreamingResultsIterator(
+      SolrClient solrServer,
+      SolrQuery solrQuery,
+      String cursorMark,
+      List<SolrReplica> replicas) {
     this.queue = new LinkedBlockingDeque<SolrDocument>();
     this.solrServer = solrServer;
 
+    this.replicas = replicas;
     // get some identifier for this solr server
     if (solrServer instanceof HttpSolrClient) {
       HttpSolrClient httpSolrClient = (HttpSolrClient)solrServer;

@@ -16,7 +16,9 @@ object SolrPartitioner {
   def getShardPartitions(shards: List[SolrShard], query: SolrQuery) : Array[Partition] = {
     shards.zipWithIndex.map{ case (shard, i) =>
       // Chose any of the replicas as the active shard to query
-      new ShardRDDPartition(i, "*", shard, query, SolrRDD.randomReplica(shard))}.toArray
+      val preferredReplica = SolrRDD.randomReplica(shard)
+      val otherReplicas = shard.replicas.filter(p => p != preferredReplica)
+      new ShardRDDPartition(i, "*", shard, query, preferredReplica, otherReplicas)}.toArray
   }
 
   def getSplitPartitions(
@@ -31,7 +33,9 @@ object SolrPartitioner {
       val replicaContinuousIterator: Iterator[SolrReplica] = Iterator.continually(shard.replicas).flatten
       val splits = SolrSupport.splitShards(query, shard, splitFieldName, splitsPerShard)
       splits.foreach(split => {
-        splitPartitions += SplitRDDPartition(counter, "*", shard, split.getSplitQuery, replicaContinuousIterator.next())
+        val preferredReplica = replicaContinuousIterator.next()
+        val otherReplicas = shard.replicas.filter(p => p != preferredReplica)
+        splitPartitions += SplitRDDPartition(counter, "*", shard, split.getSplitQuery, preferredReplica, otherReplicas)
         counter = counter + 1
       })
     })

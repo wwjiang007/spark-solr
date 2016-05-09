@@ -1,5 +1,6 @@
 package com.lucidworks.spark.query;
 
+import com.lucidworks.spark.SolrReplica;
 import com.lucidworks.spark.util.SolrQuerySupport;
 import org.apache.commons.collections.IteratorUtils;
 import org.apache.commons.io.IOUtils;
@@ -12,10 +13,7 @@ import org.apache.solr.client.solrj.io.stream.SolrStream;
 import org.apache.solr.common.SolrDocument;
 
 import java.io.IOException;
-import java.util.Iterator;
-import java.util.LinkedHashMap;
-import java.util.Map;
-import java.util.NoSuchElementException;
+import java.util.*;
 
 /**
  * An iterator over a stream of query results from one Solr Core. It is a
@@ -36,10 +34,13 @@ public class SolrStreamIterator extends ResultsIterator {
     private boolean isOpenStream;
     private SolrDocument currentTuple = null;
 
-    public SolrStreamIterator(String shardUrl, SolrClient solrServer, SolrQuery solrQuery) {
+    private List<SolrReplica> replicas;
+
+    public SolrStreamIterator(String shardUrl, SolrClient solrServer, SolrQuery solrQuery, List<SolrReplica> replicas) {
         this.solrServer = solrServer;
         this.closeAfterIterating = !(solrServer instanceof CloudSolrClient);
         this.solrQuery = solrQuery;
+        this.replicas = replicas;
 
         if (solrQuery.getRequestHandler() == null) {
             solrQuery = solrQuery.setRequestHandler("/export");

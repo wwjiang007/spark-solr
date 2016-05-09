@@ -12,7 +12,7 @@ import org.apache.spark._
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.rdd.RDD
 
-import scala.collection.JavaConverters
+import scala.collection.JavaConverters._
 import scala.util.Random
 
 class SolrRDD(
@@ -46,11 +46,11 @@ class SolrRDD(
   * Get an Iterator that uses the export handler in Solr
   */
   @throws(classOf[Exception])
-  private def getExportHandlerBasedIterator(shardUrl : String, query : SolrQuery) = {
+  private def getExportHandlerBasedIterator(shardUrl : String, query : SolrQuery, replicas: List[SolrReplica]) = {
 
     // Direct the queries to each shard, so we don't want distributed
     query.set("distrib", false)
-    new SolrStreamIterator(shardUrl, SolrSupport.getHttpSolrClient(shardUrl), query)
+    new SolrStreamIterator(shardUrl, SolrSupport.getHttpSolrClient(shardUrl), query, replicas.asJava)
   }
 
   @DeveloperApi
@@ -65,17 +65,18 @@ class SolrRDD(
         log.info("Using the shard url " + url + " for getting partition data for split: "+split)
         val resultsIterator: ResultsIterator =
           if (exportHandler.isDefined && exportHandler.get)
-            getExportHandlerBasedIterator(url, query)
+            getExportHandlerBasedIterator(url, query, partition.otherReplicas)
           else
             new StreamingResultsIterator(
               SolrSupport.getHttpSolrClient(url),
               partition.query,
-              partition.cursorMark)
+              partition.cursorMark,
+              partition.otherReplicas.asJava)
 
         context.addTaskCompletionListener { (context) =>
           log.info(f"Fetched ${resultsIterator.getNumDocs} rows from shard $url for partition ${split.index}")
         }
-        JavaConverters.asScalaIteratorConverter(resultsIterator.iterator()).asScala
+        resultsIterator.iterator().asScala
 
       case partition: AnyRef => throw new Exception("Unknown partition type '" + partition.getClass)
     }

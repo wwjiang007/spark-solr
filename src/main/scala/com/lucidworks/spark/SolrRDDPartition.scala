@@ -8,6 +8,7 @@ trait SolrRDDPartition extends Partition {
   def solrShard: SolrShard
   def query: SolrQuery
   def preferredReplica: SolrReplica // Preferred replica to query
+  def otherReplicas: List[SolrReplica]
 }
 
 case class ShardRDDPartition(
@@ -15,7 +16,8 @@ case class ShardRDDPartition(
     cursorMark: String,
     solrShard: SolrShard,
     query: SolrQuery,
-    preferredReplica: SolrReplica)
+    preferredReplica: SolrReplica,
+    otherReplicas: List[SolrReplica])
   extends SolrRDDPartition
 
 case class SplitRDDPartition(
@@ -23,5 +25,6 @@ case class SplitRDDPartition(
     cursorMark: String,
     solrShard: SolrShard,
     query: SolrQuery,
-    preferredReplica: SolrReplica)
+    preferredReplica: SolrReplica,
+    otherReplicas: List[SolrReplica])
   extends SolrRDDPartition
