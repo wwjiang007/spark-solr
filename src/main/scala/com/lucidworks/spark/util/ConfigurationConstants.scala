@@ -16,8 +16,6 @@ object ConfigurationConstants {
   val SKIP_NON_DOCVALUE_FIELDS: String = "skip_non_dv"
   val SOLR_DOC_VALUES: String = "dv"
   val FLATTEN_MULTIVALUED: String = "flatten_multivalued"
-  @deprecated
-  val USE_EXPORT_HANDLER: String = "use_export_handler"
   val REQUEST_HANDLER: String = "request_handler"
   val USE_CURSOR_MARKS: String = "use_cursor_marks"
   val SOLR_STREAMING_EXPR: String = "expr"
@@ -47,4 +45,5 @@ object ConfigurationConstants {
   val STREAMING_EXPR_SCHEMA: String = "expr_schema"
   val SOLR_SQL_SCHEMA: String = "sql_schema"
   val EXCLUDE_FIELDS: String = "exclude_fields"
+  val MAX_ROWS: String = "max_rows"
 }

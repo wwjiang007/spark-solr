@@ -33,3 +33,20 @@ case class SplitRDDPartition(
     query: SolrQuery,
     preferredReplica: SolrReplica)
   extends SolrRDDPartition
+
+case class ExportHandlerPartition(
+    index: Int,
+    solrShard: SolrShard,
+    query: SolrQuery,
+    preferredReplica: SolrReplica,
+    numWorkers: Int,
+    workerId: Int)
+  extends Partition
+
+case class SolrLimitPartition(
+    index: Int = 0,
+    zkhost:String,
+    collection:String,
+    maxRows: Int,
+    query: SolrQuery)
+  extends Partition

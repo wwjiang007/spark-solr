@@ -3,10 +3,8 @@ package com.lucidworks.spark.query;
 import com.lucidworks.spark.util.SolrSupport;
 import org.apache.log4j.Logger;
 import org.apache.solr.client.solrj.impl.CloudSolrClient;
-import org.apache.solr.client.solrj.io.Tuple;
 import org.apache.solr.client.solrj.io.stream.SolrStream;
 import org.apache.solr.client.solrj.io.stream.TupleStream;
-import org.apache.solr.common.SolrDocument;
 import org.apache.solr.common.cloud.Replica;
 import org.apache.solr.common.cloud.Slice;
 import org.apache.solr.common.cloud.ZkCoreNodeProps;
@@ -25,8 +23,6 @@ public class StreamingExpressionResultIterator extends TupleStreamIterator {
   protected String collection;
   protected String qt;
 
-  protected Set<String> promoteToDoubleFields = Collections.EMPTY_SET;
-
   private final Random random = new Random(5150L);
 
   public StreamingExpressionResultIterator(String zkHost, String collection, SolrParams solrParams) {
@@ -36,14 +32,6 @@ public class StreamingExpressionResultIterator extends TupleStreamIterator {
 
     qt = solrParams.get(CommonParams.QT);
     if (qt == null) qt = "/stream";
-
-    if ("/sql".equals(qt) || "/stream".equals(qt)) {
-      String promoteToDoubleFieldList = solrParams.get("promote_to_double");
-      if (promoteToDoubleFieldList != null) {
-        promoteToDoubleFields = new HashSet<>();
-        promoteToDoubleFields.addAll(Arrays.asList(promoteToDoubleFieldList.split(",")));
-      }
-    }
   }
 
 
@@ -89,22 +77,6 @@ public class StreamingExpressionResultIterator extends TupleStreamIterator {
       }
     }
     return stream;
-  }
-
-  // need to override to promote Long to Double for some fields (see SOLR-9372)
-  @Override
-  protected SolrDocument tuple2doc(Tuple tuple) {
-    final SolrDocument doc = new SolrDocument();
-    for (Object key : tuple.fields.keySet()) {
-      String keyStr = (String) key;
-      Object value = tuple.get(key);
-      if (value instanceof Number && promoteToDoubleFields.contains(keyStr)) {
-        doc.setField(keyStr, ((Number)value).doubleValue());
-      } else {
-        doc.setField(keyStr, value);
-      }
-    }
-    return doc;
   }
 
   protected Replica getRandomReplica() {
