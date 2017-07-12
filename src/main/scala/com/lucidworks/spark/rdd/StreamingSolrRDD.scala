@@ -64,27 +64,30 @@ class StreamingSolrRDD(
         "; this is probably incorrect so you should provide your own sort criteria.")
     }
 
-    new SolrStreamIterator(shardUrl, SolrSupport.getHttpSolrClient(shardUrl), query, numWorkers, workerId)
+    new SolrStreamIterator(shardUrl, SolrSupport.getCachedCloudClient(zkHost), SolrSupport.getCachedHttpSolrClient(shardUrl, zkHost), query, numWorkers, workerId)
   }
 
 
   @DeveloperApi
   override def compute(split: Partition, context: TaskContext): Iterator[java.util.Map[_, _]] = {
-    logger.info("Computing split")
+    logger.debug(s"Computing split: ${split.index}")
     split match {
       case partition: CloudStreamPartition =>
         logger.info(s"Using StreamingExpressionResultIterator to process streaming expression for $partition")
-        val resultsIterator = new StreamingExpressionResultIterator(partition.zkhost, partition.collection, partition.params)
+        val resultsIterator = new StreamingExpressionResultIterator(
+          SolrSupport.getCachedCloudClient(zkHost),
+          SolrSupport.getCachedHttpSolrClient(SolrSupport.getSolrBaseUrl(zkHost) + partition.collection, zkHost), // the baseUrl is just a dummy. It will be later replaced with valid host name at {@code SparkSolrClientCache#getHttpSolrClient}
+          partition.collection,
+          partition.params)
         JavaConverters.asScalaIteratorConverter(resultsIterator.iterator()).asScala
       case partition: ExportHandlerPartition =>
 
-        //TODO: Add backup mechanism to StreamingResultsIterator by being able to query any replica in case the main url goes down
-        val url = partition.preferredReplica.replicaUrl
+        val url = getReplicaToQuery(partition, context.attemptNumber())
         val query = partition.query
-        logger.info("Using the shard url " + url + " for getting partition data for split: "+ split.index)
+        logger.debug(s"Using the shard url ${url} for getting partition data for split: ${split.index}")
         val solrRequestHandler = requestHandler.getOrElse(DEFAULT_REQUEST_HANDLER)
         query.setRequestHandler(solrRequestHandler)
-        logger.info("Using export handler to fetch documents from " + partition.preferredReplica + " for query: "+partition.query)
+        logger.debug(s"Using export handler to fetch documents from ${partition.preferredReplica} for query: ${partition.query}")
         val resultsIterator = getExportHandlerBasedIterator(url, query, partition.numWorkers, partition.workerId)
         context.addTaskCompletionListener { (context) =>
           logger.info(f"Fetched ${resultsIterator.getNumDocs} rows from shard $url for partition ${split.index}")

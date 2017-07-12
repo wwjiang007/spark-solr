@@ -51,6 +51,13 @@ class SolrConf(config: Map[String, String]) extends Serializable with LazyLoggin
     Array.empty[String]
   }
 
+  def getFilters: Array[String] = {
+    if (config.contains(SOLR_FILTERS_PARAM) && config.get(SOLR_FILTERS_PARAM).isDefined) {
+      return config(SOLR_FILTERS_PARAM).split(",").map(filter => filter.trim)
+    }
+    Array.empty[String]
+  }
+
   def getRows: Option[Int] = {
     if (config.contains(SOLR_ROWS_PARAM) && config.get(SOLR_ROWS_PARAM).isDefined) {
       return Some(config.get(SOLR_ROWS_PARAM).get.toInt)
@@ -154,6 +161,13 @@ class SolrConf(config: Map[String, String]) extends Serializable with LazyLoggin
     None
   }
 
+  def genUniqChildKey: Option[Boolean] = {
+    if (config.contains(GENERATE_UNIQUE_CHILD_KEY) && config.get(GENERATE_UNIQUE_CHILD_KEY).isDefined) {
+      return Some(config.get(GENERATE_UNIQUE_CHILD_KEY).get.toBoolean)
+    }
+    None
+  }
+
   def sampleSeed: Option[Int] = {
     if (config.contains(SAMPLE_SEED) && config.get(SAMPLE_SEED).isDefined) {
       return Some(config.get(SAMPLE_SEED).get.toInt)
@@ -241,6 +255,11 @@ class SolrConf(config: Map[String, String]) extends Serializable with LazyLoggin
     if (config.contains(SKIP_NON_DOCVALUE_FIELDS) && config.get(SKIP_NON_DOCVALUE_FIELDS).isDefined) {
       return Some(config.get(SKIP_NON_DOCVALUE_FIELDS).get.toBoolean)
     }
+    None
+  }
+
+  def getChildDocFieldName: Option[String] = {
+    if (config.contains(CHILD_DOC_FIELDNAME) && config.get(CHILD_DOC_FIELDNAME).isDefined) return config.get(CHILD_DOC_FIELDNAME)
     None
   }
 
@@ -356,7 +375,9 @@ class SolrConf(config: Map[String, String]) extends Serializable with LazyLoggin
     if (batchSize.isDefined) {
       sb ++= s", ${BATCH_SIZE}=${batchSize.get}"
     }
-
+    if (getChildDocFieldName.isDefined) {
+      sb ++= s", ${CHILD_DOC_FIELDNAME}=${getChildDocFieldName.get}"
+    }
     sb ++= ")"
     sb.toString
   }

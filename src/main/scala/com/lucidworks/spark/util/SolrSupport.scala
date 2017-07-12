@@ -3,35 +3,35 @@ package com.lucidworks.spark.util
 import java.beans.{IntrospectionException, Introspector, PropertyDescriptor}
 import java.lang.reflect.Modifier
 import java.net.{ConnectException, InetAddress, SocketException, URL}
+import java.nio.file.{Files, Paths}
 import java.util.Date
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 import com.google.common.cache._
-import com.lucidworks.spark.fusion.FusionPipelineClient
-import com.lucidworks.spark.rdd.SolrRDD
-import com.lucidworks.spark.{SolrReplica, SolrShard}
 import com.lucidworks.spark.filter.DocFilterContext
-import com.lucidworks.spark.query._
+import com.lucidworks.spark.fusion.FusionPipelineClient
+import com.lucidworks.spark.util.SolrSupport.ShardInfo
+import com.lucidworks.spark.{SolrReplica, SolrShard}
 import com.typesafe.scalalogging.LazyLogging
 import org.apache.commons.httpclient.NoHttpResponseException
+import org.apache.solr.client.solrj.impl._
 import org.apache.solr.client.solrj.request.UpdateRequest
 import org.apache.solr.client.solrj.response.QueryResponse
 import org.apache.solr.client.solrj.{SolrClient, SolrQuery, SolrServerException}
-import org.apache.solr.client.solrj.impl._
-import org.apache.solr.common.{SolrDocument, SolrException, SolrInputDocument}
 import org.apache.solr.common.cloud._
+import org.apache.solr.common.{SolrDocument, SolrException, SolrInputDocument}
+import org.apache.solr.common.params.ModifiableSolrParams
 import org.apache.spark.rdd.RDD
 import org.apache.spark.streaming.dstream.DStream
-import org.apache.zookeeper.KeeperException
 import org.apache.zookeeper.KeeperException.{OperationTimeoutException, SessionExpiredException}
 
+import scala.collection.JavaConversions._
 import scala.collection.mutable
 import scala.collection.mutable.{ArrayBuffer, ListBuffer}
-import scala.collection.JavaConversions._
-import util.control.Breaks._
+import scala.util.control.Breaks._
 
-object CacheSolrClient {
+object CacheCloudSolrClient {
   private val loader = new CacheLoader[String, CloudSolrClient]() {
     def load(zkHost: String): CloudSolrClient = {
       SolrSupport.getNewSolrCloudClient(zkHost)
@@ -52,30 +52,133 @@ object CacheSolrClient {
     .build(loader)
 }
 
+object CacheHttpSolrClient {
+  private val loader = new CacheLoader[ShardInfo, HttpSolrClient]() {
+    def load(shardUrl: ShardInfo): HttpSolrClient = {
+      SolrSupport.getNewHttpSolrClient(shardUrl.shardUrl, shardUrl.zkHost)
+    }
+  }
+
+  private val listener = new RemovalListener[ShardInfo, HttpSolrClient]() {
+    def onRemoval(rn: RemovalNotification[ShardInfo, HttpSolrClient]): Unit = {
+      if (rn != null && rn.getValue != null) {
+        rn.getValue.close()
+      }
+    }
+  }
+
+  val cache: LoadingCache[ShardInfo, HttpSolrClient] = CacheBuilder
+    .newBuilder()
+    .removalListener(listener)
+    .build(loader)
+}
+
 /**
  * TODO: Use Solr schema API to index field names
  */
 object SolrSupport extends LazyLogging {
 
-  def setupKerberosIfNeeded(): Unit = synchronized {
+  val AUTH_CONFIGURER_CLASS = "auth.configurer.class"
+
+  def getFusionAuthClass(propertyName: String): Option[Class[_ <: FusionAuthHttpClient]] = {
+    val configClassProp = System.getProperty(propertyName)
+    if (configClassProp != null && !configClassProp.isEmpty) {
+      try {
+        // Get the class name, check if it's on classpath and load it
+        val clazz: Class[_] = ClassLoader.getSystemClassLoader.loadClass(configClassProp)
+        val fusionAuthClass: Class[_ <: FusionAuthHttpClient] = clazz.asSubclass(classOf[FusionAuthHttpClient])
+        return Some(fusionAuthClass)
+      } catch {
+        case _: ClassNotFoundException => logger.warn("Class name {} not found in classpath", configClassProp)
+        case _: Exception => logger.warn("Exception while loading class {}", configClassProp)
+      }
+    }
+    None
+  }
+
+  def setupKerberosIfNeeded(zkHost: String): Unit = synchronized {
     val loginProp = System.getProperty(Krb5HttpClientConfigurer.LOGIN_CONFIG_PROP)
-    if (loginProp != null && !loginProp.isEmpty) {
+    if (loginProp != null && loginProp.nonEmpty) {
       HttpClientUtil.addConfigurer(new Krb5HttpClientConfigurer)
-      logger.debug(s"Installed the Krb5HttpClientConfigurer for Solr security using config: $loginProp")
+      logger.info(s"Installed the Krb5HttpClientConfigurer for Solr security using config: $loginProp")
     }
   }
 
-  def getHttpSolrClient(shardUrl: String): HttpSolrClient = {
-    setupKerberosIfNeeded()
-    new HttpSolrClient(shardUrl)
+  def readKerberosFile(path: String): Unit = {
+    logger.debug("Contents: {}", new String(Files.readAllBytes(Paths.get(path))))
+  }
+
+  def setupBasicAuthIfNeeded(zkHost: String): Unit = synchronized {
+    val credentials = System.getProperty(PreemptiveBasicAuthConfigurer.SYS_PROP_BASIC_AUTH_CREDENTIALS)
+    val configFile = System.getProperty(PreemptiveBasicAuthConfigurer.SYS_PROP_HTTP_CLIENT_CONFIG)
+    if (credentials != null || configFile != null) {
+      if (configFile != null) {
+        logger.debug("Basic auth configured with config file {}", configFile)
+      } else {
+        logger.debug("Basic auth configured with creds {}", credentials)
+      }
+      HttpClientUtil.addConfigurer(new PreemptiveBasicAuthConfigurer)
+      logger.info(s"Installed the PreemptiveBasicAuthConfigurer for Solr basic auth")
+    }
+  }
+
+  private def getHttpSolrClient(shardUrl: String, zkHost: String): HttpSolrClient = {
+    val fusionAuthClass = getFusionAuthClass(AUTH_CONFIGURER_CLASS)
+    if (fusionAuthClass.isDefined) {
+      val authHttpClientBuilder = getAuthHttpClientBuilder(zkHost)
+      if (authHttpClientBuilder.isDefined) {
+        logger.info("Custom http client defined: {}", authHttpClientBuilder)
+        return authHttpClientBuilder.get
+          .withHttpClient(getSolrCloudClient(zkHost).getHttpClient)
+          .withBaseSolrUrl(shardUrl).build()
+      }
+    }
+    new HttpSolrClient.Builder()
+      .withBaseSolrUrl(shardUrl)
+      .withHttpClient(getCachedCloudClient(zkHost).getHttpClient)
+      .build()
+  }
+
+  case class ShardInfo(shardUrl: String, zkHost: String)
+
+  def getNewHttpSolrClient(shardUrl: String, zkHost: String): HttpSolrClient = {
+    getHttpSolrClient(shardUrl, zkHost)
+  }
+
+  def getCachedHttpSolrClient(shardUrl: String, zkHost: String): HttpSolrClient = {
+    CacheHttpSolrClient.cache.get(ShardInfo(shardUrl, zkHost))
   }
 
   // This method should not be used directly. The method [[SolrSupport.getCachedCloudClient]] should be used instead
   private def getSolrCloudClient(zkHost: String): CloudSolrClient =  {
-    setupKerberosIfNeeded()
-    val solrClient = new CloudSolrClient(zkHost)
+    setupKerberosIfNeeded(zkHost)
+    setupBasicAuthIfNeeded(zkHost)
+    val solrClientBuilder = new CloudSolrClient.Builder().withZkHost(zkHost)
+    val authHttpClientBuilder = getAuthHttpClientBuilder(zkHost)
+    if (authHttpClientBuilder.isDefined) {
+      solrClientBuilder.withLBHttpSolrClientBuilder(
+        new LBHttpSolrClient.Builder().withHttpSolrClientBuilder(authHttpClientBuilder.get))
+    }
+    val params = new ModifiableSolrParams()
+    params.set(HttpClientUtil.PROP_MAX_CONNECTIONS, 6000)
+    params.set(HttpClientUtil.PROP_MAX_CONNECTIONS_PER_HOST, 300)
+    params.set(HttpClientUtil.PROP_FOLLOW_REDIRECTS, false)
+    val httpClient = HttpClientUtil.createClient(params)
+    val solrClient = solrClientBuilder.withHttpClient(httpClient).build()
     solrClient.connect()
     solrClient
+  }
+
+  private def getAuthHttpClientBuilder(zkHost: String): Option[HttpSolrClient.Builder] = {
+    val fusionAuthClass = getFusionAuthClass(AUTH_CONFIGURER_CLASS)
+    if (fusionAuthClass.isDefined) {
+      logger.info("Custom class '{}' configured for auth", fusionAuthClass.get)
+      val authClass: Class[_ <: FusionAuthHttpClient] = fusionAuthClass.get
+      val constructor = authClass.getDeclaredConstructor(classOf[java.lang.String])
+      val authHttpClient: FusionAuthHttpClient = constructor.newInstance(zkHost)
+      return Some(authHttpClient.getHttpClientBuilder())
+    }
+    None
   }
 
   // Use this only if you want a new SolrCloudClient instance. This new instance should be closed by the methods downstream
@@ -84,7 +187,7 @@ object SolrSupport extends LazyLogging {
   }
 
   def getCachedCloudClient(zkHost: String): CloudSolrClient = {
-    CacheSolrClient.cache.get(zkHost)
+    CacheCloudSolrClient.cache.get(zkHost)
   }
 
   def getSolrBaseUrl(zkHost: String) = {
@@ -186,11 +289,14 @@ object SolrSupport extends LazyLogging {
       sendBatchToSolr(solrClient, collection, batch, commitWithin)
     } catch {
       // Reset the cache when SessionExpiredException is thrown. Plus side is that the job won't fail
-      case e @ (_: SessionExpiredException | _:OperationTimeoutException) =>
-        logger.info("Got an exception with message '" + e.getMessage +  "'.  Resetting the cached solrClient")
-        CacheSolrClient.cache.invalidate(zkHost)
-        val newClient = SolrSupport.getCachedCloudClient(zkHost)
-        sendBatchToSolr(newClient, collection, batch, commitWithin)
+      case e : Exception =>
+        SolrException.getRootCause(e) match {
+          case e1 @ (_:SessionExpiredException | _:OperationTimeoutException) =>
+            logger.info("Got an exception with message '" + e1.getMessage +  "'.  Resetting the cached solrClient")
+            CacheCloudSolrClient.cache.invalidate(zkHost)
+            val newClient = SolrSupport.getCachedCloudClient(zkHost)
+            sendBatchToSolr(newClient, collection, batch, commitWithin)
+        }
     }
   }
 

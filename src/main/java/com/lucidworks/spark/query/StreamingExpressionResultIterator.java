@@ -1,9 +1,12 @@
 package com.lucidworks.spark.query;
 
-import com.lucidworks.spark.util.SolrSupport;
+import org.apache.commons.io.IOUtils;
 import org.apache.log4j.Logger;
 import org.apache.solr.client.solrj.impl.CloudSolrClient;
+import org.apache.solr.client.solrj.impl.HttpSolrClient;
+import org.apache.solr.client.solrj.io.SolrClientCache;
 import org.apache.solr.client.solrj.io.stream.SolrStream;
+import org.apache.solr.client.solrj.io.stream.StreamContext;
 import org.apache.solr.client.solrj.io.stream.TupleStream;
 import org.apache.solr.common.cloud.Replica;
 import org.apache.solr.common.cloud.Slice;
@@ -13,7 +16,10 @@ import org.apache.solr.common.params.CommonParams;
 import org.apache.solr.common.params.ModifiableSolrParams;
 import org.apache.solr.common.params.SolrParams;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Random;
 
 public class StreamingExpressionResultIterator extends TupleStreamIterator {
 
@@ -22,18 +28,21 @@ public class StreamingExpressionResultIterator extends TupleStreamIterator {
   protected String zkHost;
   protected String collection;
   protected String qt;
+  protected CloudSolrClient cloudSolrClient;
+  protected HttpSolrClient httpSolrClient;
+  protected SolrClientCache solrClientCache;
 
   private final Random random = new Random(5150L);
 
-  public StreamingExpressionResultIterator(String zkHost, String collection, SolrParams solrParams) {
+  public StreamingExpressionResultIterator(CloudSolrClient cloudSolrClient, HttpSolrClient httpSolrClient, String collection, SolrParams solrParams) {
     super(solrParams);
-    this.zkHost = zkHost;
+    this.cloudSolrClient = cloudSolrClient;
+    this.httpSolrClient = httpSolrClient;
     this.collection = collection;
 
     qt = solrParams.get(CommonParams.QT);
     if (qt == null) qt = "/stream";
   }
-
 
   protected TupleStream openStream() {
     TupleStream stream;
@@ -65,6 +74,7 @@ public class StreamingExpressionResultIterator extends TupleStreamIterator {
       log.info("Sending "+qt+" request to replica "+url+" of "+collection+" with params: "+params);
       long startMs = System.currentTimeMillis();
       stream = new SolrStream(url, params);
+      stream.setStreamContext(getStreamContext());
       stream.open();
       long diffMs = (System.currentTimeMillis() - startMs);
       log.info("Open stream to "+url+" took "+diffMs+" (ms)");
@@ -79,8 +89,15 @@ public class StreamingExpressionResultIterator extends TupleStreamIterator {
     return stream;
   }
 
+  // We have to set the streaming context so that we can pass our own cloud client with authentication
+  protected StreamContext getStreamContext() {
+    StreamContext context = new StreamContext();
+    solrClientCache = new SparkSolrClientCache(cloudSolrClient, httpSolrClient);
+    context.setSolrClientCache(solrClientCache);
+    return context;
+  }
+
   protected Replica getRandomReplica() {
-    CloudSolrClient cloudSolrClient = SolrSupport.getCachedCloudClient(zkHost);
     ZkStateReader zkStateReader = cloudSolrClient.getZkStateReader();
     Collection<Slice> slices = zkStateReader.getClusterState().getCollection(collection).getActiveSlices();
     if (slices == null || slices.size() == 0)

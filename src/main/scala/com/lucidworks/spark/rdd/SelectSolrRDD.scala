@@ -1,9 +1,9 @@
 package com.lucidworks.spark.rdd
 
-import com.lucidworks.spark.{SolrLimitPartition, SolrPartitioner, SolrRDDPartition}
 import com.lucidworks.spark.query.StreamingResultsIterator
 import com.lucidworks.spark.util.QueryConstants._
 import com.lucidworks.spark.util.{SolrQuerySupport, SolrSupport}
+import com.lucidworks.spark.{SelectSolrRDDPartition, SolrLimitPartition, SolrPartitioner}
 import com.typesafe.scalalogging.LazyLogging
 import org.apache.solr.client.solrj.SolrQuery
 import org.apache.solr.common.SolrDocument
@@ -44,15 +44,14 @@ class SelectSolrRDD(
   @DeveloperApi
   override def compute(split: Partition, context: TaskContext): Iterator[SolrDocument] = {
     split match {
-      case partition: SolrRDDPartition => {
-        //TODO: Add backup mechanism to StreamingResultsIterator by being able to query any replica in case the main url goes down
-        val url = partition.preferredReplica.replicaUrl
+      case partition: SelectSolrRDDPartition => {
+        val url = getReplicaToQuery(partition, context.attemptNumber())
         val query = partition.query
-        logger.info("Using the shard url " + url + " for getting partition data for split: " + split.index)
+        logger.debug(s"Using the shard url ${url} for getting partition data for split: ${split.index}")
         val solrRequestHandler = requestHandler.getOrElse(DEFAULT_REQUEST_HANDLER)
         query.setRequestHandler(solrRequestHandler)
-        logger.info("Using cursorMarks to fetch documents from " + partition.preferredReplica + " for query: " + partition.query)
-        val resultsIterator = new StreamingResultsIterator(SolrSupport.getHttpSolrClient(url), partition.query, partition.cursorMark)
+        logger.debug(s"Using cursorMarks to fetch documents from ${partition.preferredReplica} for query: ${partition.query}")
+        val resultsIterator = new StreamingResultsIterator(SolrSupport.getCachedHttpSolrClient(url, zkHost), partition.query, partition.cursorMark)
         context.addTaskCompletionListener { (context) =>
           logger.info(f"Fetched ${resultsIterator.getNumDocs} rows from shard $url for partition ${split.index}")
         }

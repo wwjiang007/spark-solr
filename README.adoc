@@ -17,9 +17,8 @@ chart below shows the versions supported across the past releases. 'Connector' r
 [width="40%",frame="topbot",options="header,footer"]
 |======================
 |Connector      | Spark | Solr
-|http://search.maven.org/#artifactdetails%7Ccom.lucidworks.spark%7Cspark-solr%7C3.0.0-beta4%7Cjar[3.0.0-beta4]  | 2.1.0 | 6.5.1
+|http://search.maven.org/#artifactdetails%7Ccom.lucidworks.spark%7Cspark-solr%7C3.0.1%7Cjar[3.0.1]  | 2.1.1 | 6.5.1
 |http://search.maven.org/#artifactdetails%7Ccom.lucidworks.spark%7Cspark-solr%7C3.0.0-beta3%7Cjar[3.0.0-beta3]  | 2.1.0 | 6.4.2
-|http://search.maven.org/#artifactdetails%7Ccom.lucidworks.spark%7Cspark-solr%7C3.0.0-beta2%7Cjar[3.0.0-beta2]  | 2.1.0 | 6.4.2
 |http://search.maven.org/#artifactdetails%7Ccom.lucidworks.spark%7Cspark-solr%7C3.0.0-beta%7Cjar[3.0.0-beta]  | 2.1.0 | 6.3.0
 |http://search.maven.org/#artifactdetails%7Ccom.lucidworks.spark%7Cspark-solr%7C3.0.0-alpha.2%7Cjar[3.0.0-alpha.2]  | 2.0.1 | 6.2.1
 |http://search.maven.org/#artifactdetails%7Ccom.lucidworks.spark%7Cspark-solr%7C2.4.0%7Cjar[2.4.0]          | 1.6.3 | 6.4.2
@@ -38,7 +37,7 @@ chart below shows the versions supported across the past releases. 'Connector' r
 
 [source]
 cd $SPARK_HOME
-./bin/spark-shell --jars spark-solr-3.0.0-alpha.2-shaded.jar
+./bin/spark-shell --jars spark-solr-3.0.1-shaded.jar
 
 The shaded jar can be downloaded from the http://search.maven.org/#search%7Cgav%7C1%7Cg%3A%22com.lucidworks.spark%22%20AND%20a%3A%22spark-solr%22[Maven Central] or built from the respective branch
 
@@ -186,6 +185,12 @@ You can also specify an alias for a field using Solr's field alias syntax, e.g. 
 `foo:div(sum(x,100),max(y,1)):double`
 
 TIP: If you request Solr function queries, then the library must use the `/select` handler to make the request as exporting function queries through `/export` is not supported by Solr.
+
+==== filters
+
+You can use the `filters` option to set filter queries on Solr query:
+
+Usage: `option("filters","firstName:Sam,lastName:Powell")`
 
 ==== rows
 
@@ -436,9 +441,11 @@ See `com.lucidworks.spark.example.streaming.oneusagov.OneUsaGovStreamProcessor` 
 //end::spark-app[]
 
 //tag::spark-auth[]
-== Authenticating with Kerberized Solr
+== Authenticating with Solr
 
 For background on Solr security, see: https://cwiki.apache.org/confluence/display/solr/Security.
+
+=== Kerberos
 
 The SparkApp framework allows you to pass the path to a JAAS authentication configuration file using the `-solrJaasAuthConfig option`.
 
@@ -464,6 +471,30 @@ spark-submit --master yarn-server \
   hdfs-to-solr -zkHost $ZK -collection spark-hdfs \
   -hdfsPath /user/spark/testdata/syn_sample_50k \
   -solrJaasAuthConfig=/path/to/jaas-client.conf
+
+
+== Basic Auth
+
+Basic auth can be configured via System properties `basicauth` or `solr.httpclient.config`. These system properties have to be set on Driver and Executor JVMs
+
+Examples:
+
+Using `basicauth`
+[source]
+ ./bin/spark-shell --master local[*] --jars ~/Git/spark-solr/target/spark-solr-3.0.1-SNAPSHOT-shaded.jar  --conf 'spark.driver.extraJavaOptions=-Dbasicauth=solr:SolrRocks'
+
+
+Using `solr.httpclient.config`
+[source]
+ ./bin/spark-shell --master local[*] --jars ~/Git/spark-solr/target/spark-solr-3.0.1-SNAPSHOT-shaded.jar  --conf 'spark.driver.extraJavaOptions=-Dsolr.httpclient.config=/Users/kiran/spark/spark-2.1.0-bin-hadoop2.7/auth.txt'
+
+
+Contents of config file
+
+[source]
+httpBasicAuthUser=solr
+httpBasicAuthPassword=SolrRocks
+
 
 //end::spark-auth[]
 //end::spark-devdocs[]
