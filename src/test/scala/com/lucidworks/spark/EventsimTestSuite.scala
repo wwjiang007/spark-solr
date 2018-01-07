@@ -4,13 +4,14 @@ import java.util.Collections
 
 import com.lucidworks.spark.rdd.SelectSolrRDD
 import com.lucidworks.spark.util.ConfigurationConstants._
+import com.lucidworks.spark.util.SolrDataFrameImplicits._
 import com.lucidworks.spark.util.{QueryField, SolrRelationUtil}
 import org.apache.solr.client.solrj.SolrQuery
 import org.apache.solr.client.solrj.SolrQuery.SortClause
+import org.apache.spark.solr.SparkInternalObjects
 import org.apache.spark.sql.DataFrame
 
 import scala.collection.JavaConverters._
-import com.lucidworks.spark.util.SolrDataFrameImplicits._
 
 class EventsimTestSuite extends EventsimBuilder {
 
@@ -19,7 +20,7 @@ class EventsimTestSuite extends EventsimBuilder {
       .query("*:*")
       .rows(10)
       .select(Array("id"))
-    assert(solrRDD.getNumPartitions == numShards*2)
+    assert(solrRDD.getNumPartitions == numShards*4)
     testCommons(solrRDD)
   }
 
@@ -62,6 +63,21 @@ class EventsimTestSuite extends EventsimBuilder {
     assert(df.count() == eventSimCount)
   }
 
+  test("count query with custom accumulator name") {
+    val acc_name = "custom_acc_name_records_read"
+    val df: DataFrame = sparkSession.read.format("solr")
+      .option("zkHost", zkHost)
+      .option("collection", collectionName)
+      .option(ACCUMULATOR_NAME, acc_name)
+      .load()
+    assert(df.count() == eventSimCount)
+    val acc_id: Option[Long] = SparkSolrAccumulatorContext.getId(acc_name)
+    assert(acc_id.isDefined)
+    val acc = SparkInternalObjects.getAccumulatorById(acc_id.get)
+    assert(acc.isDefined)
+    assert(acc.get.value == eventSimCount)
+  }
+
   test("SQL query splits") {
     val options = Map(
       "zkHost" -> zkHost,
@@ -70,7 +86,7 @@ class EventsimTestSuite extends EventsimBuilder {
     )
     val df: DataFrame = sparkSession.read.format("solr").options(options).load()
     assert(df.rdd.getNumPartitions > numShards)
-    assert(df.rdd.getNumPartitions == 4)
+    assert(df.rdd.getNumPartitions == 8)
   }
 
   test("SQL query splits with export handler") {
@@ -184,6 +200,14 @@ class EventsimTestSuite extends EventsimBuilder {
     assert(timeQueryDF.count() == 1)
   }
 
+  test("Multiple WHERE clauses") {
+    val df: DataFrame = sparkSession.read.option("zkhost", zkHost).solr(collectionName)
+    df.createOrReplaceTempView("events")
+
+    val timeQueryDF = sparkSession.sql("SELECT * from events WHERE `status` == 200 OR `status` == 404 or `status` == 300 or `status` == 400")
+    assert(timeQueryDF.count() == 987)
+  }
+
   // Ignored since Spark is not passing timestamps filters to the buildScan method. Range timestamp filtering is being done at Spark layer
   ignore("Timestamp range filter queries") {
     val df: DataFrame = sparkSession.read.format("solr")
@@ -253,6 +277,19 @@ class EventsimTestSuite extends EventsimBuilder {
     solrRelation.initialQuery.setSorts(Collections.emptyList())
     SolrRelation.addSortField(solrRelation.baseSchema.get, querySchema, solrRelation.initialQuery, solrRelation.uniqueKey)
     assert(solrRelation.initialQuery.getSorts == Collections.singletonList(new SortClause(solrRelation.uniqueKey, SolrQuery.ORDER.asc)))
+  }
+
+  test("Test dynamic extensions") {
+    val options = Map(
+      SOLR_ZK_HOST_PARAM -> zkHost,
+      SOLR_COLLECTION_PARAM -> collectionName
+    )
+    val solrRelation = new SolrRelation(options, None, sparkSession)
+    val suffixes = solrRelation.dynamicSuffixes
+    assert(suffixes.contains("s_"))
+    assert(suffixes.contains("random_"))
+    assert(suffixes.contains("_l"))
+    assert(suffixes.contains("_dpf"))
   }
 
   test("Get documents with max_rows config") {

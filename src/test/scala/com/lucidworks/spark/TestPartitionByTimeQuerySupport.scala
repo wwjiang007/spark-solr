@@ -1,13 +1,14 @@
 package com.lucidworks.spark
 
 import com.lucidworks.spark.util.{SolrCloudUtil, SolrSupport}
+import org.apache.solr.client.solrj.SolrQuery
 import org.apache.spark.sql.SaveMode._
 
+import com.lucidworks.spark.util.ConfigurationConstants._
 /**
  This class is used to test the PartitionByTimeQuerySupport class
   */
 class TestPartitionByTimeQuerySupport extends TestSuiteBuilder {
-
 
   test("Test partition selection for query") {
     val collection1Name = "test" + "_2014_11_24_17_30"
@@ -61,6 +62,10 @@ class TestPartitionByTimeQuerySupport extends TestSuiteBuilder {
       solrDF = sparkSession.read.format("solr").options(solrOpts).load()
       assert(solrDF.count == 63)
 
+      // querying a range with multiple timestamps
+      solrOpts = Map("zkhost" -> zkHost, "collection" -> baseCollectionName,"partition_by" -> "time","time_period" -> "1MINUTES","filters" -> "timestamp_tdt:[2014-11-24T17:30:00Z TO *],timestamp_tdt:[* TO 2014-11-24T17:31:00Z]")
+      solrDF = sparkSession.read.format("solr").options(solrOpts).load()
+      assert(solrDF.count == 34)
 
     } finally {
       SolrCloudUtil.deleteCollection(collection1Name, cluster)
@@ -69,5 +74,94 @@ class TestPartitionByTimeQuerySupport extends TestSuiteBuilder {
     }
   }
 
+  test("Test partition selection with gaps") {
+    val rangeQuery = "timestamp:{2017-09-09T00:00:00.00Z TO *]"
+    val solrQuery = new SolrQuery()
+    solrQuery.addFilterQuery(rangeQuery)
+
+    val dfParams = Map(
+      PARTITION_BY -> "time",
+      TIMESTAMP_FIELD_NAME -> "timestamp",
+      TIME_PERIOD -> "1DAYS",
+      DATETIME_PATTERN -> "yyyy_MM_dd",
+      TIMEZONE_ID -> "UTC",
+      "collection" -> "events"
+    )
+    val solrConf = new SolrConf(dfParams)
+
+    val timePartitioningQuery = new TimePartitioningQuery(solrConf, solrQuery)
+    val allPartitions = List("events_2017_09_01", "events_2017_09_03", "events_2017_09_05", "events_2017_09_07",
+      "events_2017_09_10", "events_2017_09_11", "events_2017_09_13")
+    val selectedPartitions = timePartitioningQuery.getCollectionsForRangeQuery(rangeQuery, allPartitions)
+    assert(selectedPartitions.toSet == Set("events_2017_09_07", "events_2017_09_10", "events_2017_09_11", "events_2017_09_13"))
+  }
+
+  test("Test partition selection") {
+    val rangeQuery = "timestamp:{2017-09-09T00:00:00.00Z TO *]"
+    val solrQuery = new SolrQuery()
+    solrQuery.addFilterQuery(rangeQuery)
+
+    val dfParams = Map(
+      PARTITION_BY -> "time",
+      TIMESTAMP_FIELD_NAME -> "timestamp",
+      TIME_PERIOD -> "1DAYS",
+      DATETIME_PATTERN -> "yyyy_MM_dd",
+      TIMEZONE_ID -> "UTC",
+      "collection" -> "events"
+    )
+    val solrConf = new SolrConf(dfParams)
+
+    val timePartitioningQuery = new TimePartitioningQuery(solrConf, solrQuery)
+    val allPartitions = List("events_2017_09_01", "events_2017_09_03", "events_2017_09_05", "events_2017_09_07",
+      "events_2017_09_09", "events_2017_09_10", "events_2017_09_11", "events_2017_09_13")
+    val selectedPartitions = timePartitioningQuery.getCollectionsForRangeQuery(rangeQuery, allPartitions)
+    assert(selectedPartitions.toSet == Set("events_2017_09_09", "events_2017_09_10", "events_2017_09_11", "events_2017_09_13"))
+  }
+
+  test("Test partition selection upper bound") {
+    val rangeQuery = "timestamp:[* TO 2017-09-09T00:00:00.00Z}"
+    val solrQuery = new SolrQuery()
+    solrQuery.addFilterQuery(rangeQuery)
+
+    val dfParams = Map(
+      PARTITION_BY -> "time",
+      TIMESTAMP_FIELD_NAME -> "timestamp",
+      TIME_PERIOD -> "1DAYS",
+      DATETIME_PATTERN -> "yyyy_MM_dd",
+      TIMEZONE_ID -> "UTC",
+      "collection" -> "events"
+    )
+    val solrConf = new SolrConf(dfParams)
+
+    val timePartitioningQuery = new TimePartitioningQuery(solrConf, solrQuery)
+    val allPartitions = List("events_2017_09_01", "events_2017_09_03", "events_2017_09_05", "events_2017_09_07",
+      "events_2017_09_09", "events_2017_09_10", "events_2017_09_11", "events_2017_09_13")
+    val selectedPartitions = timePartitioningQuery.getCollectionsForRangeQuery(rangeQuery, allPartitions)
+    assert(selectedPartitions.toSet == Set("events_2017_09_01", "events_2017_09_03", "events_2017_09_05", "events_2017_09_07", "events_2017_09_09"))
+  }
+
+  test("Test partition selection lower bound and upper bound") {
+    val rangeQuery1 = "timestamp:[* TO 2017-09-09T00:00:00.00Z}"
+    val rangeQuery2 = "timestamp:{2017-09-07T00:00:00.00Z TO *]"
+    val solrQuery = new SolrQuery()
+    solrQuery.addFilterQuery(rangeQuery1)
+    solrQuery.addFilterQuery(rangeQuery2)
+
+    val dfParams = Map(
+      PARTITION_BY -> "time",
+      TIMESTAMP_FIELD_NAME -> "timestamp",
+      TIME_PERIOD -> "1DAYS",
+      DATETIME_PATTERN -> "yyyy_MM_dd",
+      TIMEZONE_ID -> "UTC",
+      "collection" -> "events"
+    )
+    val solrConf = new SolrConf(dfParams)
+
+    val timePartitioningQuery = new TimePartitioningQuery(solrConf, solrQuery)
+    val allPartitions = List("events_2017_09_01", "events_2017_09_03", "events_2017_09_05", "events_2017_09_07",
+      "events_2017_09_09", "events_2017_09_10", "events_2017_09_11", "events_2017_09_13")
+    val selectedPartitions = timePartitioningQuery.getCollectionsForRangeQueries(Array(rangeQuery1, rangeQuery2), allPartitions)
+    assert(selectedPartitions.toSet == Set("events_2017_09_07", "events_2017_09_09"))
+  }
 
 }

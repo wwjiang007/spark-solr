@@ -8,7 +8,7 @@ import com.lucidworks.spark.rdd.SolrRDD
 import com.typesafe.scalalogging.LazyLogging
 import org.apache.solr.client.solrj.SolrRequest.METHOD
 import org.apache.solr.client.solrj._
-import org.apache.solr.client.solrj.impl.{CloudSolrClient, InputStreamResponseParser, StreamingBinaryResponseParser}
+import org.apache.solr.client.solrj.impl.{CloudSolrClient, HttpSolrClient, InputStreamResponseParser, StreamingBinaryResponseParser}
 import org.apache.solr.client.solrj.request.schema.SchemaRequest
 import org.apache.solr.client.solrj.request.schema.SchemaRequest.UniqueKey
 import org.apache.solr.client.solrj.request.{LukeRequest, QueryRequest}
@@ -68,12 +68,19 @@ object SolrQuerySupport extends LazyLogging {
     "solr.StrField" -> DataTypes.StringType,
     "solr.TextField" -> DataTypes.StringType,
     "solr.BoolField" -> DataTypes.BooleanType,
+    "solr.BinaryField" -> DataTypes.BinaryType,
+
     "solr.TrieIntField" -> DataTypes.LongType,
     "solr.TrieLongField" -> DataTypes.LongType,
     "solr.TrieFloatField" -> DataTypes.DoubleType,
     "solr.TrieDoubleField" -> DataTypes.DoubleType,
     "solr.TrieDateField" -> DataTypes.TimestampType,
-    "solr.BinaryField" -> DataTypes.BinaryType
+
+    "solr.IntPointField" -> DataTypes.LongType,
+    "solr.LongPointField" -> DataTypes.LongType,
+    "solr.FloatPointField" -> DataTypes.DoubleType,
+    "solr.DoublePointField" -> DataTypes.DoubleType,
+    "solr.DatePointField" -> DataTypes.TimestampType
   )
 
   def getUniqueKey(zkHost: String, collection: String): String = {
@@ -248,12 +255,17 @@ object SolrQuerySupport extends LazyLogging {
     SolrQuerySupport.addDefaultSort(solrQuery, uniqueKey)
   }
 
-  def getFieldTypes(fields: Set[String], solrUrl: String, cloudClient: CloudSolrClient, collection: String): Map[String, SolrFieldMeta] = {
+  def getFieldTypes(
+      fields: Set[String],
+      solrUrl: String,
+      cloudClient: CloudSolrClient,
+      collection: String,
+      skipDynamicExtensions: Boolean=true): Map[String, SolrFieldMeta] = {
     val fieldTypeMap = new mutable.HashMap[String, SolrFieldMeta]()
     val fieldTypeToClassMap = getFieldTypeToClassMap(cloudClient, collection)
     logger.debug("Get field types for fields: {} ", fields.mkString(","))
     val fieldDefinitionsFromSchema = getFieldDefinitionsFromSchema(solrUrl, fields.toSeq, cloudClient, collection)
-    fieldDefinitionsFromSchema.filterKeys(k => !k.startsWith("*_") && !k.endsWith("_*")).foreach {
+    fieldDefinitionsFromSchema.filterKeys(k => if (skipDynamicExtensions) !k.startsWith("*_") && !k.endsWith("_*") else true).foreach {
       case(name, payloadRef) =>
       payloadRef match {
         case m: Map[_, _] if m.keySet.forall(_.isInstanceOf[String])=>
@@ -452,10 +464,20 @@ object SolrQuerySupport extends LazyLogging {
   }
 
   def getFieldsFromLuke(zkHost: String, collection: String): Set[String] = {
-    val cloudClient = SolrSupport.getCachedCloudClient(zkHost)
+    val shardList = SolrSupport.buildShardList(zkHost, collection)
+    val fieldSetBuffer: ListBuffer[String] = ListBuffer.empty[String]
+    shardList.foreach(shard => {
+      val randomReplica = SolrRDD.randomReplica(shard)
+      val replicaHttpClient = SolrSupport.getCachedHttpSolrClient(randomReplica.replicaUrl, zkHost)
+      fieldSetBuffer.++=(getFieldsFromLukePerShard(zkHost, replicaHttpClient))
+    })
+    fieldSetBuffer.toSet
+  }
+
+  def getFieldsFromLukePerShard(zkHost: String, httpSolrClient: HttpSolrClient): Set[String] = {
     val lukeRequest = new LukeRequest()
     lukeRequest.setNumTerms(0)
-    val lukeResponse = lukeRequest.process(cloudClient, collection)
+    val lukeResponse = lukeRequest.process(httpSolrClient)
     if (lukeResponse.getStatus != 0) {
       throw new RuntimeException(
         "Solr request returned with status code '" + lukeResponse.getStatus + "'. Response: '" + lukeResponse.getResponse.toString)
@@ -554,7 +576,7 @@ object SolrQuerySupport extends LazyLogging {
       pivotFields: Array[PivotField],
       solrRDD: SolrRDD[_],
       escapeFieldNames: Boolean): DataFrame = {
-    val schema = SolrRelationUtil.getBaseSchema(solrRDD.zkHost, solrRDD.collection, escapeFieldNames, true, false)
+    val schema = SolrRelationUtil.getBaseSchema(solrRDD.zkHost, solrRDD.collection, escapeFieldNames, Some(true), false, Set.empty)
     val schemaWithPivots = toPivotSchema(solrData.schema, pivotFields, solrRDD.collection, schema, solrRDD.uniqueKey, solrRDD.zkHost)
 
     val withPivotFields: RDD[Row] = solrData.rdd.map(row => {

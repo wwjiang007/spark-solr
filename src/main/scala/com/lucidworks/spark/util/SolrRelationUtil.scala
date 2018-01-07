@@ -30,12 +30,9 @@ case class QueryField(name:String, alias: Option[String] = None, funcReturnType:
 
 object SolrRelationUtil extends LazyLogging {
 
-  val dynamicExtensionSuffixes = mutable.Seq("_i", "_s", "_l", "_b", "_f",
-    "_d", "_tdt", "_tdts", "_ss", "_ii", "_txt", "_txt_en", "_ls").seq
-
-  def isValidDynamicFieldName(fieldName: String): Boolean = {
+  def isValidDynamicFieldName(fieldName: String, dynamicExtensionSuffixes: Set[String]): Boolean = {
     dynamicExtensionSuffixes.foreach(ext => {
-      if (fieldName.endsWith(ext)) return true
+      if (fieldName.startsWith(ext) || fieldName.endsWith(ext)) return true
     })
     false
   }
@@ -69,17 +66,19 @@ object SolrRelationUtil extends LazyLogging {
       zkHost: String,
       collection: String,
       escapeFields: Boolean,
-      flattenMultivalued: Boolean,
-      skipNonDocValueFields: Boolean): StructType =
-    getBaseSchema(Set.empty[String], zkHost, collection, escapeFields, flattenMultivalued, skipNonDocValueFields)
+      flattenMultivalued: Option[Boolean],
+      skipNonDocValueFields: Boolean,
+      dynamicExtensions: Set[String]): StructType =
+    getBaseSchema(Set.empty[String], zkHost, collection, escapeFields, flattenMultivalued, skipNonDocValueFields, dynamicExtensions)
 
   def getBaseSchema(
       fields: Set[String],
       zkHost: String,
       collection: String,
       escapeFields: Boolean,
-      flattenMultivalued: Boolean,
-      skipNonDocValueFields: Boolean): StructType = {
+      flattenMultivalued: Option[Boolean],
+      skipNonDocValueFields: Boolean,
+      dynamicExtensions: Set[String]): StructType = {
     // If the collection is empty (no documents), return an empty schema
     if (SolrQuerySupport.getNumDocsFromSolr(collection, zkHost, None) == 0)
       return new StructType()
@@ -118,7 +117,12 @@ object SolrRelationUtil extends LazyLogging {
       metadata.putString("name", fieldName)
       metadata.putString("type", fieldMeta.fieldType)
 
-      if (!flattenMultivalued && fieldMeta.isMultiValued.isDefined) {
+      val keepFieldMultivalued = if (flattenMultivalued.isEmpty) {
+        SolrRelationUtil.isValidDynamicFieldName(fieldName, dynamicExtensions)
+      } else {
+        !flattenMultivalued.get
+      }
+      if (keepFieldMultivalued && fieldMeta.isMultiValued.isDefined) {
         if (fieldMeta.isMultiValued.get) {
           dataType = new ArrayType(dataType, true)
           metadata.putBoolean("multiValued", value = true)
@@ -211,14 +215,49 @@ object SolrRelationUtil extends LazyLogging {
   def applyFilter(filter: Filter, solrQuery: SolrQuery, baseSchema: StructType) = {
    filter match {
      case f: And =>
-       solrQuery.addFilterQuery(fq(f.left, baseSchema))
-       solrQuery.addFilterQuery(fq(f.right, baseSchema))
+       val values = getAllFilterValues(f, baseSchema, ListBuffer.empty[String])
+       values.foreach(v => solrQuery.addFilterQuery(v))
      case f: Or =>
-       solrQuery.addFilterQuery("(" + fq(f.left, baseSchema) + " OR " + fq(f.right, baseSchema) + ")")
+       val values = getAllFilterValues(f, baseSchema, ListBuffer.empty[String])
+       val fqStringBuilder = new StringBuilder
+       for (i <- values.indices) {
+         if (i == 0) fqStringBuilder.append("(")
+         fqStringBuilder.append(values(i))
+         if (i != values.size-1) {
+           fqStringBuilder.append(" OR ")
+         } else {
+           fqStringBuilder.append(")")
+         }
+       }
+       if (fqStringBuilder.nonEmpty) solrQuery.addFilterQuery(fqStringBuilder.toString())
      case f: Not =>
        solrQuery.addFilterQuery("NOT " + fq(f.child, baseSchema))
      case _ => solrQuery.addFilterQuery(fq(filter, baseSchema))
    }
+  }
+
+  def getAllFilterValues(filter: Filter, baseSchema: StructType, values: ListBuffer[String]): List[String] = {
+    filter match {
+      case f: And =>
+        f.left match {
+          case l: And => getAllFilterValues(l, baseSchema, values)
+          case _ => values.+=(fq(f.left, baseSchema))
+        }
+        f.right match {
+          case r: And => getAllFilterValues(r, baseSchema, values)
+          case _ => values.+=(fq(f.right, baseSchema))
+        }
+      case f: Or =>
+        f.left match {
+          case l: Or => getAllFilterValues(l, baseSchema, values)
+          case _ => values.+=(fq(f.left, baseSchema))
+        }
+        f.right match {
+          case r: Or => getAllFilterValues(r, baseSchema, values)
+          case _ => values.+=(fq(f.right, baseSchema))
+        }
+    }
+    values.toList
   }
 
   def getFilterValue(attr: String, value: String, baseSchema: StructType) = {
@@ -243,7 +282,13 @@ object SolrRelationUtil extends LazyLogging {
     filter match {
       case f: EqualTo =>
         attr = Some(f.attribute)
-        crit = Some(getFilterValue(f.attribute, String.valueOf(f.value), baseSchema))
+        val equalToValue: String = getFilterValue(f.attribute, String.valueOf(f.value), baseSchema)
+        if (equalToValue.startsWith("\"") && equalToValue.endsWith("\"")) {
+          crit = Some(equalToValue)
+        } else {
+          // Surround the value with double quotes to escape special characters in Strings
+          crit = Some(s""""$equalToValue"""")
+        }
       case f: EqualNullSafe =>
         attr = Some(f.attribute)
         crit = Some(getFilterValue(f.attribute, String.valueOf(f.value), baseSchema))
@@ -279,13 +324,13 @@ object SolrRelationUtil extends LazyLogging {
         negate = "-"
       case f: StringContains =>
         attr = Some(f.attribute)
-        crit = Some("*" + f.value + "*")
+        crit = Some("(*" + f.value + "*)")
       case f: StringEndsWith =>
         attr = Some(f.attribute)
-        crit = Some("*"+f.value)
+        crit = Some("(*" + f.value + ")")
       case f: StringStartsWith =>
         attr = Some(f.attribute)
-        crit = Some(f.value+"*")
+        crit = Some("(" + f.value + "*)")
       case _ => throw new IllegalArgumentException("Filters of type '" + filter + " (" + filter.getClass.getName + ")' not supported!")
     }
 

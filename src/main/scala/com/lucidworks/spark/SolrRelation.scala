@@ -1,5 +1,6 @@
 package com.lucidworks.spark
 
+import java.io.IOException
 import java.util.UUID
 import java.util.regex.Pattern
 
@@ -9,10 +10,11 @@ import com.lucidworks.spark.util.ConfigurationConstants._
 import com.lucidworks.spark.util.QueryConstants._
 import com.lucidworks.spark.util._
 import com.typesafe.scalalogging.LazyLogging
-import org.apache.solr.client.solrj.SolrQuery
 import org.apache.solr.client.solrj.SolrQuery.SortClause
+import org.apache.solr.client.solrj.impl.CloudSolrClient
 import org.apache.solr.client.solrj.io.stream.expr._
 import org.apache.solr.client.solrj.request.schema.SchemaRequest.{AddField, MultiUpdate, Update}
+import org.apache.solr.client.solrj.{SolrQuery, SolrServerException}
 import org.apache.solr.common.SolrException.ErrorCode
 import org.apache.solr.common.params.{CommonParams, ModifiableSolrParams}
 import org.apache.solr.common.{SolrException, SolrInputDocument}
@@ -22,8 +24,8 @@ import org.apache.spark.sql.sources._
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.{DataFrame, Row, SQLContext, SparkSession}
 
-import scala.collection.breakOut
 import scala.collection.JavaConverters._
+import scala.collection.breakOut
 import scala.collection.mutable.ListBuffer
 import scala.reflect.runtime.universe._
 import scala.util.control.Breaks._
@@ -49,40 +51,19 @@ class SolrRelation(
 
   checkRequiredParams()
 
-  var collection = conf.getCollection.getOrElse({
-    var coll = Option.empty[String]
-    if (conf.getSqlStmt.isDefined) {
-      val collectionFromSql = SolrRelation.findSolrCollectionNameInSql(conf.getSqlStmt.get)
-      if (collectionFromSql.isDefined) {
-        coll = collectionFromSql
-      }
-    }
-    if (coll.isDefined) {
-      logger.info(s"resolved collection option from sql to be ${coll.get}")
-      coll.get
-    } else {
-      throw new IllegalArgumentException("collection option is required!")
-    }
-  })
-
   // Warn about unknown parameters
   val unknownParams = SolrRelation.checkUnknownParams(parameters.keySet)
   if (unknownParams.nonEmpty)
     logger.warn("Unknown parameters passed to query: " + unknownParams.toString())
 
-  if (conf.partition_by.isDefined && conf.partition_by.get=="time") {
-    val feature = new PartitionByTimeQueryParams(conf)
-    val p = new PartitionByTimeQuerySupport(feature,conf)
-    val allCollections = p.getPartitionsForQuery()
-    collection = allCollections mkString ","
-  }
-
+  lazy val initialQuery: SolrQuery = SolrRelation.buildQuery(conf)
   // we don't need the baseSchema for streaming expressions, so we wrap it in an optional
   var baseSchema : Option[StructType] = None
 
+  lazy val collection = resolveCollection()
+
   // loaded lazily to avoid going to Solr until it's necessary, mainly to assist with mocking this class for unit tests
   lazy val uniqueKey: String = SolrQuerySupport.getUniqueKey(conf.getZkHost.get, collection.split(",")(0))
-  lazy val initialQuery: SolrQuery = buildQuery
 
   // to handle field aliases and function queries, we need to parse the fields option
   // from the user into QueryField objects
@@ -102,6 +83,16 @@ class SolrRelation(
 
   // Preserve the initial filters if any present in arbitrary config
   lazy val queryFilters: Array[String] = if (initialQuery.getFilterQueries != null) initialQuery.getFilterQueries else Array.empty[String]
+
+  lazy val dynamicSuffixes: Set[String] = SolrQuerySupport.getFieldTypes(
+    Set.empty,
+    SolrSupport.getSolrBaseUrl(conf.getZkHost.get),
+    SolrSupport.getCachedCloudClient(conf.getZkHost.get),
+    collection.split(",")(0),
+    skipDynamicExtensions = false
+  ).keySet
+      .filter(f => f.startsWith("*_") || f.endsWith("_*"))
+      .map(f => if (f.startsWith("*_")) f.substring(1) else f.substring(0, f.length-1))
 
   lazy val querySchema: StructType = {
     if (dataFrame.isDefined) {
@@ -134,8 +125,9 @@ class SolrRelation(
                 conf.getZkHost.get,
                 sf.collection,
                 conf.escapeFieldNames.getOrElse(false),
-                conf.flattenMultivalued.getOrElse(true),
-                conf.skipNonDocValueFields.getOrElse(false))
+                conf.flattenMultivalued,
+                conf.skipNonDocValueFields.getOrElse(false),
+                dynamicSuffixes)
             logger.debug(s"Got stream schema: ${streamSchema} for ${sf}")
             sf.fields.foreach(fld => {
               val fieldName = fld.alias.getOrElse(fld.name)
@@ -285,8 +277,9 @@ class SolrRelation(
       conf.getZkHost.get,
       collection.split(",")(0),
       conf.escapeFieldNames.getOrElse(false),
-      conf.flattenMultivalued.getOrElse(true),
-      conf.skipNonDocValueFields.getOrElse(false))
+      conf.flattenMultivalued,
+      conf.skipNonDocValueFields.getOrElse(false),
+      dynamicSuffixes)
   }
 
   def findStreamingExpressionFields(expr: StreamExpressionParameter, streamOutputFields: ListBuffer[StreamFields], depth: Int) : Unit = {
@@ -551,7 +544,7 @@ class SolrRelation(
         if (isFDV && isSDV) {
           qt = QT_EXPORT
           query.setRequestHandler(qt)
-          logger.info("Using the /export handler because docValues are enabled for all fields and no unsupported field types have been requested.")
+          logger.debug("Using the /export handler because docValues are enabled for all fields and no unsupported field types have been requested.")
         } else {
           logger.debug(s"Using requestHandler: $qt isFDV? $isFDV and isSDV? $isSDV")
         }
@@ -565,6 +558,12 @@ class SolrRelation(
           query.setSort(uniqueKey, SolrQuery.ORDER.asc)
       }
       logger.info(s"Sending ${query} to SolrRDD using ${qt} with maxRows: ${conf.maxRows}")
+      // Register an accumulator for counting documents
+      val acc: SparkSolrAccumulator = new SparkSolrAccumulator
+      val accName = if (conf.getAccumulatorName.isDefined) conf.getAccumulatorName.get else "Records Read"
+      sparkSession.sparkContext.register(acc, accName)
+      SparkSolrAccumulatorContext.add(accName, acc.id)
+
       // Construct the SolrRDD based on the request handler
       val solrRDD: SolrRDD[_] = SolrRDD.apply(
         conf.getZkHost.get,
@@ -574,7 +573,8 @@ class SolrRelation(
         splitsPerShard = conf.getSplitsPerShard,
         splitField = getSplitField(conf),
         uKey = Some(uniqueKey),
-        maxRows = conf.maxRows)
+        maxRows = conf.maxRows,
+        accumulator = Some(acc))
       val docs = solrRDD.query(query)
       logger.debug(s"Converting SolrRDD of type ${docs.getClass.getName} to rows matching schema: ${scanSchema}")
       val rows = SolrRelationUtil.toRows(scanSchema, docs)
@@ -622,40 +622,6 @@ class SolrRelation(
     return rq == QT_EXPORT || rq == QT_STREAM || rq == QT_SQL
   }
 
-  def toSolrType(dataType: DataType): String = {
-    dataType match {
-      case bi: BinaryType => "binary"
-      case b: BooleanType => "boolean"
-      case dt: DateType => "tdate"
-      case db: DoubleType => "tdouble"
-      case dec: DecimalType => "tdouble"
-      case ft: FloatType => "tfloat"
-      case i: IntegerType => "tint"
-      case l: LongType => "tlong"
-      case s: ShortType => "tint"
-      case t: TimestampType => "tdate"
-      case _ => "string"
-    }
-  }
-
-  def toAddFieldMap(sf: StructField): Map[String,AnyRef] = {
-    val map = scala.collection.mutable.Map[String,AnyRef]()
-    map += ("name" -> sf.name)
-    map += ("indexed" -> "true")
-    map += ("stored" -> "true")
-    map += ("docValues" -> "true")
-    val dataType = sf.dataType
-    dataType match {
-      case at: ArrayType =>
-        map += ("multiValued" -> "true")
-        map += ("type" -> toSolrType(at.elementType))
-      case _ =>
-        map += ("multiValued" -> "false")
-        map += ("type" -> toSolrType(dataType))
-    }
-    map.toMap
-  }
-
   override def insert(df: DataFrame, overwrite: Boolean): Unit = {
 
     val zkHost = conf.getZkHost.get
@@ -663,42 +629,33 @@ class SolrRelation(
     val dfSchema = df.schema
     val solrBaseUrl = SolrSupport.getSolrBaseUrl(zkHost)
     val cloudClient = SolrSupport.getCachedCloudClient(zkHost)
+    val solrVersion = SolrSupport.getSolrVersion(zkHost)
 
     val solrFields : Map[String, SolrFieldMeta] =
       SolrQuerySupport.getFieldTypes(Set(), solrBaseUrl + collectionId + "/", cloudClient, collectionId)
     val fieldNameForChildDocuments = conf.getChildDocFieldName.getOrElse(DEFAULT_CHILD_DOC_FIELD_NAME)
 
     // build up a list of updates to send to the Solr Schema API
-    val fieldsToAddToSolr = new ListBuffer[Update]()
+    val fieldsToAddToSolr = scala.collection.mutable.HashMap.empty[String,AddField]
     dfSchema.fields.foreach(f => {
-      // TODO: we should load all dynamic field extensions from Solr for making a decision here
-      if (!solrFields.contains(f.name) && !SolrRelationUtil.isValidDynamicFieldName(f.name)) {
+      if (!solrFields.contains(f.name) && !SolrRelationUtil.isValidDynamicFieldName(f.name, dynamicSuffixes)) {
         if(f.name == fieldNameForChildDocuments) {
           val e = f.dataType.asInstanceOf[ArrayType].elementType.asInstanceOf[StructType]
           e.foreach(ef => {
-            logger.info(s"adding new field: ${toAddFieldMap(ef).asJava}")
-            fieldsToAddToSolr += new AddField(toAddFieldMap(ef).asJava)
+            val addFieldMap = SolrRelation.toAddFieldMap(ef, solrVersion)
+            logger.info(s"adding new field: ${addFieldMap.mkString(", ")}")
+            fieldsToAddToSolr += (ef.name -> new AddField(addFieldMap.asJava))
           })
         } else {
-          logger.info(s"adding new field: ${toAddFieldMap(f).asJava}")
-          fieldsToAddToSolr += new AddField(toAddFieldMap(f).asJava)
+          val addFieldMap = SolrRelation.toAddFieldMap(f, solrVersion)
+          logger.info(s"adding new field: ${addFieldMap.mkString(", ")}")
+          fieldsToAddToSolr += (f.name -> new AddField(addFieldMap.asJava))
         }
       }
     })
 
-    val solrParams = new ModifiableSolrParams()
-    solrParams.add("updateTimeoutSecs","30")
-    val addFieldsUpdateRequest = new MultiUpdate(fieldsToAddToSolr.asJava, solrParams)
-
     if (fieldsToAddToSolr.nonEmpty) {
-      logger.info(s"Sending request to Solr schema API to add ${fieldsToAddToSolr.size} fields.")
-      val updateResponse : org.apache.solr.client.solrj.response.schema.SchemaResponse.UpdateResponse =
-        addFieldsUpdateRequest.process(cloudClient, collectionId)
-      if (updateResponse.getStatus >= 400) {
-        val errMsg = "Schema update request failed due to: "+updateResponse
-        logger.error(errMsg)
-        throw new SolrException(ErrorCode.getErrorCode(updateResponse.getStatus), errMsg)
-      }
+      SolrRelation.addFieldsForInsert(fieldsToAddToSolr.toMap, collectionId, cloudClient)
     }
 
     if (conf.softAutoCommitSecs.isDefined) {
@@ -768,10 +725,50 @@ class SolrRelation(
       }
       doc
     })
-    SolrSupport.indexDocs(zkHost, collectionId, batchSize, docs, conf.commitWithin)
+    val acc: SparkSolrAccumulator = new SparkSolrAccumulator
+    val accName = if (conf.getAccumulatorName.isDefined) conf.getAccumulatorName.get else "Records Written"
+    sparkSession.sparkContext.register(acc, accName)
+    SparkSolrAccumulatorContext.add(accName, acc.id)
+    SolrSupport.indexDocs(zkHost, collectionId, batchSize, docs, conf.commitWithin, Some(acc))
+    logger.info("Written {} documents to Solr collection {}", acc.value, collectionId)
   }
 
-  private def buildQuery: SolrQuery = {
+  private def checkRequiredParams(): Unit = {
+    require(conf.getZkHost.isDefined, "Param '" + SOLR_ZK_HOST_PARAM + "' is required")
+  }
+
+  private def resolveCollection(): String = {
+    var collection = conf.getCollection.getOrElse({
+      var coll = Option.empty[String]
+      if (conf.getSqlStmt.isDefined) {
+        val collectionFromSql = SolrRelation.findSolrCollectionNameInSql(conf.getSqlStmt.get)
+        if (collectionFromSql.isDefined) {
+          coll = collectionFromSql
+        }
+      }
+      if (coll.isDefined) {
+        logger.info(s"resolved collection option from sql to be ${coll.get}")
+        coll.get
+      } else {
+        throw new IllegalArgumentException("collection option is required!")
+      }
+    })
+    if (conf.partitionBy.isDefined && conf.partitionBy.get == "time") {
+      val timePartitionQuery = new TimePartitioningQuery(conf, initialQuery)
+      val allCollections = timePartitionQuery.getPartitionsForQuery()
+      logger.info(s"Collection rewritten from ${collection} to ${allCollections}")
+      collection =  allCollections.mkString(",")
+    }
+    initialQuery.set("collection", collection)
+    collection
+  }
+}
+
+object SolrRelation extends LazyLogging {
+
+  val solrCollectionInSqlPattern = Pattern.compile("\\sfrom\\s([\\w\\-\\.]+)\\s?", Pattern.CASE_INSENSITIVE)
+
+  def buildQuery(conf: SolrConf): SolrQuery = {
     val query = SolrQuerySupport.toQuery(conf.getQuery.getOrElse("*:*"))
     val solrParams = conf.getArbitrarySolrParams
 
@@ -820,18 +817,8 @@ class SolrRelation(
       }
     }
     query.add(solrParams)
-    query.set("collection", collection)
     query
   }
-
-  private def checkRequiredParams(): Unit = {
-    require(conf.getZkHost.isDefined, "Param '" + SOLR_ZK_HOST_PARAM + "' is required")
-  }
-}
-
-object SolrRelation extends LazyLogging {
-
-  val solrCollectionInSqlPattern = Pattern.compile("\\sfrom\\s([\\w\\-\\.]+)\\s?", Pattern.CASE_INSENSITIVE)
 
   def findSolrCollectionNameInSql(sqlText: String): Option[String] = {
     val collectionIdMatcher = solrCollectionInSqlPattern.matcher(sqlText)
@@ -938,6 +925,113 @@ object SolrRelation extends LazyLogging {
       }
     }
     sortClauses.toList
+  }
+
+  def addNewFieldsToSolrIfNeeded(dfSchema: StructType, zkHost: String, collectionId: String, solrVersion: String): Set[String] = {
+    val solrBaseUrl = SolrSupport.getSolrBaseUrl(zkHost)
+    val cloudClient = SolrSupport.getCachedCloudClient(zkHost)
+    val solrFields : Map[String, SolrFieldMeta] =
+      SolrQuerySupport.getFieldTypes(Set(), solrBaseUrl + collectionId + "/", cloudClient, collectionId)
+    val fieldsToAddToSolr = scala.collection.mutable.HashMap.empty[String,AddField]
+    dfSchema.fields.foreach(f => {
+      if (!solrFields.contains(f.name)) {
+        fieldsToAddToSolr += (f.name -> new AddField(SolrRelation.toAddFieldMap(f, solrVersion).asJava))
+      }
+    })
+    if (fieldsToAddToSolr.nonEmpty) {
+      SolrRelation.addFieldsForInsert(fieldsToAddToSolr.toMap, collectionId, cloudClient)
+    }
+    fieldsToAddToSolr.keySet.toSet
+  }
+
+  def addFieldsForInsert(fieldsToAddToSolr: Map[String,AddField], collectionId: String, cloudClient: CloudSolrClient) = {
+    logger.info(s"Sending request to Solr schema API to add ${fieldsToAddToSolr.size} fields.")
+    val solrParams = new ModifiableSolrParams()
+    solrParams.add("updateTimeoutSecs","30")
+    val updateList : java.util.ArrayList[Update] = new java.util.ArrayList[Update]
+    fieldsToAddToSolr.values.foreach(v => updateList.add(v))
+    val addFieldsUpdateRequest = new MultiUpdate(updateList, solrParams)
+
+    val updateResponse : org.apache.solr.client.solrj.response.schema.SchemaResponse.UpdateResponse =
+      addFieldsUpdateRequest.process(cloudClient, collectionId)
+    if (updateResponse.getStatus >= 400) {
+      val errMsg = "Schema update request failed due to: "+updateResponse
+      logger.error(errMsg)
+      throw new SolrException(ErrorCode.getErrorCode(updateResponse.getStatus), errMsg)
+    } else {
+      logger.info(s"Request to add ${fieldsToAddToSolr.size} fields returned: ${updateResponse}")
+      val respNL = updateResponse.getResponse
+      if (respNL != null) {
+        val errors = respNL.get("errors")
+        if (errors != null) {
+          logger.error(s"Request to add ${fieldsToAddToSolr.size} fields failed with errors: ${errors}. Will re-try each add individually ...")
+          fieldsToAddToSolr.foreach((pair) => {
+            try {
+              val resp = pair._2.process(cloudClient, collectionId)
+              if (resp.getResponse.get("errors") != null) {
+                val e2 = resp.getResponse.get("errors")
+                logger.warn(s"Add field ${pair._1} failed due to: ${e2}")
+              } else {
+                logger.info(s"Add field ${pair._1} returned: $resp")
+              }
+            } catch {
+              case se: SolrServerException => logger.warn(s"Add schema field ${pair._1} failed due to: $se")
+              case ioe: IOException => logger.warn(s"Add schema field ${pair._1} failed due to: $ioe")
+            }
+          })
+        }
+      }
+    }
+  }
+
+  def toAddFieldMap(sf: StructField, solrVersion: String): Map[String,AnyRef] = {
+    val map = scala.collection.mutable.Map[String,AnyRef]()
+    map += ("name" -> sf.name)
+    map += ("indexed" -> "true")
+    map += ("stored" -> "true")
+    map += ("docValues" -> "true")
+    val dataType = sf.dataType
+    dataType match {
+      case at: ArrayType =>
+        map += ("multiValued" -> "true")
+        if (SolrSupport.isSolrVersionAtleast(solrVersion, 7, 0, 0))
+          map += ("type" -> toNewSolrType(at.elementType))
+        else
+          map += ("type" -> toOldSolrType(at.elementType))
+      case _ =>
+        map += ("multiValued" -> "false")
+        if (SolrSupport.isSolrVersionAtleast(solrVersion, 7, 0, 0))
+          map += ("type" -> toNewSolrType(dataType))
+        else
+          map += ("type" -> toOldSolrType(dataType))
+    }
+    map.toMap
+  }
+
+  def toOldSolrType(dataType: DataType): String = {
+    dataType match {
+      case BinaryType => "binary"
+      case BooleanType => "boolean"
+      case DateType | TimestampType => "tdate"
+      case DoubleType | _: DecimalType => "tdouble"
+      case FloatType => "tfloat"
+      case IntegerType | ShortType => "tint"
+      case LongType => "tlong"
+      case _ => "string"
+    }
+  }
+
+  def toNewSolrType(dataType: DataType): String = {
+    dataType match {
+      case BinaryType => "binary"
+      case BooleanType => "boolean"
+      case DateType | TimestampType => "pdate"
+      case DoubleType | _: DecimalType => "pdouble"
+      case FloatType => "pfloat"
+      case IntegerType | ShortType => "pint"
+      case LongType => "plong"
+      case _ => "string"
+    }
   }
 }
 

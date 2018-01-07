@@ -37,7 +37,7 @@ object ConfigurationConstants {
   // Time series partitioning params
 
   val PARTITION_BY:String="partition_by"
-  val TIME_STAMP_FIELD_NAME:String="time_stamp_field_name"
+  val TIMESTAMP_FIELD_NAME:String="timestamp_field_name"
   val TIME_PERIOD:String="time_period"
   val DATETIME_PATTERN:String="datetime_pattern"
   val TIMEZONE_ID:String="timezone_id"
@@ -49,4 +49,6 @@ object ConfigurationConstants {
   val SOLR_SQL_SCHEMA: String = "sql_schema"
   val EXCLUDE_FIELDS: String = "exclude_fields"
   val MAX_ROWS: String = "max_rows"
+
+  val ACCUMULATOR_NAME: String = "acc_name"
 }

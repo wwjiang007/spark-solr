@@ -41,6 +41,7 @@ public class SolrRelationTest extends RDDProcessorTestBase {
       options.put(SOLR_COLLECTION_PARAM(), testCollection);
       options.put(SAMPLE_SEED(), "5150");
       options.put(SAMPLE_PCT(), "0.1");
+      options.put(SOLR_SPLITS_PER_SHARD_PARAM(), "2");
       Dataset fromSolr = sparkSession.read().format(Constants.SOLR_FORMAT()).options(options).load();
       long count = fromSolr.count();
 
@@ -212,15 +213,6 @@ public class SolrRelationTest extends RDDProcessorTestBase {
   }
 
   @Test
-  public void testDynamicFieldNames() throws Exception {
-    Dataset aggDF = sparkSession.read().json("src/test/resources/test-data/em_sample.json");
-    for (String fieldName : aggDF.schema().fieldNames()) {
-      if (!fieldName.equals("id") && !fieldName.equals("_version_"))
-        assertTrue("Failed for field name '" + fieldName + "'", SolrRelationUtil.isValidDynamicFieldName(fieldName));
-    }
-  }
-
-  @Test
   public void testAggDataFrame() throws Exception {
     String testCollection = "testAggDataFrame";
     try {
@@ -270,7 +262,6 @@ public class SolrRelationTest extends RDDProcessorTestBase {
     Map<String, String> options = new HashMap<String, String>();
     options.put(SOLR_ZK_HOST_PARAM(), zkHost);
     options.put(SOLR_COLLECTION_PARAM(), testCollection);
-    options.put(FLATTEN_MULTIVALUED(), "false");
     options.put(ARBITRARY_PARAMS_STRING(), "sort=id asc");
 
     // now read the data back from Solr and validate that it was saved correctly and that all data type handling is correct
@@ -301,7 +292,6 @@ public class SolrRelationTest extends RDDProcessorTestBase {
       Map<String, String> options = new HashMap<String, String>();
       options.put(SOLR_ZK_HOST_PARAM(), zkHost);
       options.put(SOLR_COLLECTION_PARAM(), testCollection);
-      options.put(FLATTEN_MULTIVALUED(), "false");
 
       Dataset df = sparkSession.read().format("solr").options(options).load();
       df.show();
@@ -365,7 +355,6 @@ public class SolrRelationTest extends RDDProcessorTestBase {
       HashMap<String, String> newOptions = new HashMap<String, String>();
       newOptions.put(SOLR_ZK_HOST_PARAM(), zkHost);
       newOptions.put(SOLR_COLLECTION_PARAM(), testCollection2);
-      newOptions.put(FLATTEN_MULTIVALUED(), "false");
       newOptions.put(SOFT_AUTO_COMMIT_SECS(), "2");
 
       Dataset cleanDF = sparkSession.read().format("solr").options(options).load();

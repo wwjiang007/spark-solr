@@ -3,7 +3,7 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>com.lucidworks.spark</groupId>
   <artifactId>spark-solr</artifactId>
-  <version>3.1.0-SNAPSHOT</version>
+  <version>3.4.0-SNAPSHOT</version>
   <packaging>jar</packaging>
   <name>spark-solr</name>
   <description>Tools for reading data from Spark into Solr</description>
@@ -37,8 +37,8 @@
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <java.version>1.8</java.version>
-    <spark.version>2.1.1</spark.version>
-    <solr.version>6.6.0</solr.version>
+    <spark.version>2.2.0</spark.version>
+    <solr.version>7.1.0</solr.version>
     <fasterxml.version>2.4.0</fasterxml.version>
     <scala.version>2.11.8</scala.version>
     <scala.binary.version>2.11</scala.binary.version>
@@ -379,18 +379,28 @@
           <groupId>org.eclipse.jetty.orbit</groupId>
           <artifactId>javax.servlet</artifactId>
         </exclusion>
+        <exclusion>
+          <groupId>io.dropwizard.metrics</groupId>
+          <artifactId>metrics-core</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>io.dropwizard.metrics</groupId>
+          <artifactId>metrics-jvm</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>io.dropwizard.metrics</groupId>
+          <artifactId>metrics-json</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>io.dropwizard.metrics</groupId>
+          <artifactId>metrics-graphite</artifactId>
+        </exclusion>
       </exclusions>
     </dependency>
     <dependency>
       <groupId>com.esotericsoftware</groupId>
       <artifactId>kryo-shaded</artifactId>
       <version>3.0.3</version>
-      <scope>compile</scope>
-    </dependency>
-    <dependency>
-      <groupId>com.codahale.metrics</groupId>
-      <artifactId>metrics-core</artifactId>
-      <version>3.0.0</version>
       <scope>compile</scope>
     </dependency>
     <dependency>
@@ -485,7 +495,7 @@
     <dependency>
       <groupId>org.apache.commons</groupId>
       <artifactId>commons-lang3</artifactId>
-      <version>3.3.2</version>
+      <version>3.5</version>
     </dependency>
     <dependency>
       <groupId>junit</groupId>

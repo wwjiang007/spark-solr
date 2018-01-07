@@ -2,23 +2,23 @@ package com.lucidworks.spark.fusion;
 
 import com.codahale.metrics.Meter;
 import com.codahale.metrics.MetricRegistry;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.module.scala.DefaultScalaModule;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.http.Header;
-import org.apache.http.HttpEntity;
-import org.apache.http.HttpException;
-import org.apache.http.HttpRequest;
-import org.apache.http.HttpRequestInterceptor;
-import org.apache.http.HttpResponse;
+import org.apache.http.*;
 import org.apache.http.auth.UsernamePasswordCredentials;
 import org.apache.http.client.CookieStore;
 import org.apache.http.client.HttpClient;
 import org.apache.http.client.config.CookieSpecs;
 import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.client.methods.HttpUriRequest;
 import org.apache.http.client.protocol.HttpClientContext;
+import org.apache.http.client.utils.URIBuilder;
 import org.apache.http.cookie.Cookie;
 import org.apache.http.entity.ContentProducer;
 import org.apache.http.entity.ContentType;
@@ -29,30 +29,19 @@ import org.apache.http.impl.client.BasicCookieStore;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.impl.cookie.BasicClientCookie;
+import org.apache.http.message.BasicNameValuePair;
 import org.apache.http.protocol.HttpContext;
 import org.apache.http.util.EntityUtils;
 import org.apache.solr.client.solrj.impl.HttpClientUtil;
-import org.apache.solr.client.solrj.impl.Krb5HttpClientConfigurer;
+import org.apache.solr.client.solrj.impl.Krb5HttpClientBuilder;
+import org.apache.solr.client.solrj.impl.SolrHttpClientBuilder;
 import org.apache.solr.common.SolrException;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.module.scala.DefaultScalaModule;
-
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
+import java.io.*;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Random;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -69,12 +58,13 @@ public class FusionPipelineClient {
     if (jassFile == null)
       return;
 
-    log.info("Using kerberized Solr.");
+    final String appname = System.getProperty(LWWW_JAAS_APPNAME, "Client");
+    log.info("Using kerberized Solr with "+jassFile+" and appname: "+appname);
     System.setProperty("sun.security.krb5.debug", "true");
     System.setProperty("java.security.auth.login.config", jassFile);
-    final String appname = System.getProperty(LWWW_JAAS_APPNAME, "Client");
     System.setProperty("solr.kerberos.jaas.appname", appname);
-    HttpClientUtil.setConfigurer(new Krb5HttpClientConfigurer());
+    SolrHttpClientBuilder httpClientBuilder = new Krb5HttpClientBuilder().getBuilder();
+    HttpClientUtil.setHttpClientBuilder(httpClientBuilder);
   }
 
   // for basic auth to the pipeline service
@@ -143,8 +133,6 @@ public class FusionPipelineClient {
     if (lwwJaasFile != null && !lwwJaasFile.isEmpty()) {
       setSecurityConfig(lwwJaasFile);
       httpClient = HttpClientUtil.createClient(null);
-      HttpClientUtil.setMaxConnections(httpClient, 1000);
-      HttpClientUtil.setMaxConnectionsPerHost(httpClient, 1000);
       isKerberos = true;
     } else {
       globalConfig = RequestConfig.custom().setCookieSpec(CookieSpecs.BEST_MATCH).setConnectTimeout(30*1000).setSocketTimeout(90*1000).build();
@@ -259,9 +247,10 @@ public class FusionPipelineClient {
       HttpClientContext context = HttpClientContext.create();
       context.setCookieStore(cookieStore);
 
-      HttpResponse response = httpClient.execute(postRequest, context);
-      HttpEntity entity = response.getEntity();
+      CloseableHttpResponse response = httpClient.execute(postRequest, context);
+      HttpEntity entity = null;
       try {
+        entity = response.getEntity();
         int statusCode = response.getStatusLine().getStatusCode();
         if (statusCode != 200 && statusCode != 201 && statusCode != 204) {
           String body = extractResponseBodyText(entity);
@@ -294,7 +283,8 @@ public class FusionPipelineClient {
         }
       } finally {
         if (entity != null)
-          EntityUtils.consume(entity);
+          EntityUtils.consumeQuietly(entity);
+        response.close();
       }
       log.info("Established secure session with Fusion Session API on " + sessionKey + " for user " + user + " in realm " + realm);
     }
@@ -378,6 +368,7 @@ public class FusionPipelineClient {
   public HttpClient getHttpClient() {
     return httpClient;
   }
+  public ObjectMapper getJsonObjectMapper() { return jsonObjectMapper; }
 
   public String getAvailableServer() {
     try {
@@ -426,6 +417,10 @@ public class FusionPipelineClient {
   }
 
   public void postBatchToPipeline(String pipelinePath, List docs) throws Exception {
+    postBatchToPipeline(pipelinePath, docs, PIPELINE_DOC_CONTENT_TYPE);
+  }
+
+  public void postBatchToPipeline(String pipelinePath, List docs, String contentType) throws Exception {
     int numDocs = docs.size();
 
     if (!pipelinePath.startsWith("/"))
@@ -454,7 +449,7 @@ public class FusionPipelineClient {
           log.debug("POSTing batch of " + numDocs + " input docs to " + hostAndPort + pipelinePath + " as request " + requestId);
 
         Exception retryAfterException =
-                postJsonToPipelineWithRetry(hostAndPort, pipelinePath, docs, mutable, lastExc, requestId);
+                postJsonToPipelineWithRetry(hostAndPort, pipelinePath, docs, mutable, lastExc, requestId, contentType);
         if (retryAfterException == null) {
           lastExc = null;
           break; // request succeeded ...
@@ -474,7 +469,7 @@ public class FusionPipelineClient {
       if (log.isDebugEnabled())
         log.debug("POSTing batch of " + numDocs + " input docs to " + hostAndPort + pipelinePath + " as request " + requestId);
 
-      Exception exc = postJsonToPipelineWithRetry(hostAndPort, pipelinePath, docs, mutable, null, requestId);
+      Exception exc = postJsonToPipelineWithRetry(hostAndPort, pipelinePath, docs, mutable, null, requestId, contentType);
       if (exc != null)
         throw exc;
     }
@@ -485,12 +480,13 @@ public class FusionPipelineClient {
                                                   List docs,
                                                   ArrayList<String> mutable,
                                                   Exception lastExc,
-                                                  int requestId)
+                                                  int requestId,
+                                                  String contentType)
           throws Exception {
     String url = hostAndPort + pipelinePath;
     Exception retryAfterException = null;
     try {
-      postJsonToPipeline(hostAndPort, pipelinePath, docs, requestId);
+      postJsonToPipeline(hostAndPort, pipelinePath, docs, requestId, contentType);
       if (lastExc != null)
         log.info("Re-try request " + requestId + " to " + url + " succeeded after seeing a " + lastExc.getMessage());
     } catch (Exception exc) {
@@ -511,7 +507,7 @@ public class FusionPipelineClient {
           Thread.interrupted();
         }
         // note we want the exception to propagate from here up the stack since we re-tried and it didn't work
-        postJsonToPipeline(hostAndPort, pipelinePath, docs, requestId);
+        postJsonToPipeline(hostAndPort, pipelinePath, docs, requestId, contentType);
         log.info("Re-try request " + requestId + " to " + url + " succeeded");
         retryAfterException = null; // return success condition
       }
@@ -536,6 +532,10 @@ public class FusionPipelineClient {
   }
 
   public void postJsonToPipeline(String hostAndPort, String pipelinePath, List docs, int requestId) throws Exception {
+    postJsonToPipeline(hostAndPort, pipelinePath, docs, requestId, PIPELINE_DOC_CONTENT_TYPE);
+  }
+
+  public void postJsonToPipeline(String hostAndPort, String pipelinePath, List docs, int requestId, String contentType) throws Exception {
     FusionSession fusionSession = getSession(hostAndPort, requestId);
     String postUrl = hostAndPort + pipelinePath;
     if (postUrl.indexOf("?") != -1) {
@@ -546,7 +546,7 @@ public class FusionPipelineClient {
 
     HttpPost postRequest = new HttpPost(postUrl);
     EntityTemplate et = new EntityTemplate(new JacksonContentProducer(jsonObjectMapper, docs));
-    et.setContentType(PIPELINE_DOC_CONTENT_TYPE);
+    et.setContentType(contentType != null ? contentType : PIPELINE_DOC_CONTENT_TYPE);
     et.setContentEncoding(StandardCharsets.UTF_8.name());
     postRequest.setEntity(et);
 
@@ -642,11 +642,7 @@ public class FusionPipelineClient {
 
     public void close() {
       if (delegate != null) {
-        try {
-          EntityUtils.consume(delegate);
-        } catch (Exception ignore) {
-          log.warn("Failed to consume entity due to: " + ignore);
-        }
+        EntityUtils.consumeQuietly(delegate);
       }
 
       if (httpResponse != null) {
@@ -700,6 +696,70 @@ public class FusionPipelineClient {
     public void consumeContent() throws IOException {
       delegate.consumeContent();
     }
+  }
+
+  public JsonNode queryFusion(String pipelinePath, Map<String,String> queryParams) throws Exception {
+    List<NameValuePair> params = new ArrayList<>(queryParams.size());
+    for (String p : queryParams.keySet()) {
+      if (!"wt".equals(p)) {
+        String v = queryParams.get(p);
+        if (v != null) {
+          params.add(new BasicNameValuePair(p,v));
+        }
+      }
+    }
+    return queryFusion(pipelinePath, params);
+  }
+
+  public JsonNode queryFusion(String pipelinePath, List<NameValuePair> queryParams) throws Exception {
+    if (!pipelinePath.startsWith("/"))
+      pipelinePath = "/" + pipelinePath;
+
+    String availableServer = getAvailableServer();
+    URIBuilder builder = new URIBuilder(availableServer + pipelinePath);
+    builder.addParameters(queryParams);
+    builder.addParameter("wt","json");
+    HttpGet httpGet = new HttpGet(builder.build());
+
+    JsonNode respJson = null;
+    HttpEntity resp = null;
+    try {
+      resp = sendRequestToFusion(httpGet, true);
+      if (resp != null) {
+        // parse the JSON before closing the response
+        respJson = jsonObjectMapper.readTree(resp.getContent());
+      }
+    } catch (IOException ioExc) {
+      // if IO exception, reset and retry if there's another server available ...
+      String nextAvailableServer = getAvailableServer();
+      if (!nextAvailableServer.equals(availableServer)) {
+        if (log.isDebugEnabled()) {
+          log.debug("Send query to " + availableServer + " failed due to: " + ioExc + " ... retrying at " + nextAvailableServer);
+        }
+
+        builder = new URIBuilder(nextAvailableServer + pipelinePath);
+        builder.addParameters(queryParams);
+        builder.addParameter("wt","json");
+        httpGet = new HttpGet(builder.build());
+        resp = sendRequestToFusion(httpGet, true);
+        if (resp != null) {
+          // parse the JSON before closing the response
+          respJson = jsonObjectMapper.readTree(resp.getContent());
+        }
+      } else {
+        // no other server available ... just fail on IO error
+        throw ioExc;
+      }
+    } finally {
+      if (resp != null) {
+        if (resp instanceof HttpEntityAndResponse) {
+          ((HttpEntityAndResponse)resp).close();
+        } else {
+          EntityUtils.consumeQuietly(resp);
+        }
+      }
+    }
+    return respJson;
   }
 
   public HttpEntity sendRequestToFusion(HttpUriRequest httpRequest) throws Exception {
@@ -793,11 +853,7 @@ public class FusionPipelineClient {
     Object statusLine = response.getStatusLine();
 
     if (entity != null) {
-      try {
-        EntityUtils.consume(entity);
-      } catch (Exception ignore) {
-        log.warn("Failed to consume entity due to: " + ignore);
-      }
+      EntityUtils.consumeQuietly(entity);
     }
 
     if (response instanceof CloseableHttpResponse) {
